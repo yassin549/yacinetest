@@ -46,9 +46,14 @@ class FaceRegistry:
 
 
 def face_quality(face_bgr):
-    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-    sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-    return sharpness
+    if face_bgr is None or face_bgr.size == 0:
+        return 0.0
+    try:
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return float(sharpness)
+    except cv2.error:
+        return 0.0
 
 
 def classify_pose_action(kpts, kpt_conf, bbox):

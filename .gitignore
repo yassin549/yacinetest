@@ -3,6 +3,7 @@ data/
 *.db-shm
 *.db-wal
 *.pt
+.env
 credentials.txt
 __pycache__/
 *.pyc
