@@ -6,6 +6,15 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+from PIL import Image
+
+try:
+    from transformers import BlipProcessor, BlipForConditionalGeneration
+    _HAS_VLM = True
+except Exception:
+    BlipProcessor = None
+    BlipForConditionalGeneration = None
+    _HAS_VLM = False
 
 cv2.setUseOptimized(True)
 cpu_threads = max(1, (os.cpu_count() or 2) // 2)
@@ -16,7 +25,7 @@ torch.set_num_interop_threads(1)
 model = YOLO("yolov8n.pt")
 
 # Lower latency: use substream (subtype=1) if your camera supports it.
-RTSP_URL = "rtsp://pyuser:yacine03041973@192.168.1.70:554/cam/realmonitor?channel=1&subtype=1"
+RTSP_URL = "rtsp://mluser:yacine03041973@192.168.1.29:554/cam/realmonitor?channel=1&subtype=0"
 
 # Force low-latency FFmpeg options for RTSP (OpenCV picks these up).
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -39,6 +48,12 @@ MAX_DET = 50
 INFER_EVERY = 2  # send one frame to detector every N displayed frames
 DRAW_LABELS = True  # show class labels; set False for maximum smoothness
 SHOW_CONF = True    # confidence text adds extra draw cost
+
+CAPTION_ENABLED = True
+CAPTION_EVERY_SEC = 5.0
+CAPTION_IMG_SIZE = 384
+CAPTION_MODEL_ID = "Salesforce/blip-image-captioning-base"
+CAPTION_MAX_LEN = 30
 
 class LatestFrame:
     def __init__(self, capture):
@@ -152,6 +167,82 @@ if DEVICE != "cpu":
 frame_idx = 0
 detector = AsyncDetector(model).start()
 
+class AsyncCaptioner:
+    def __init__(self):
+        self.input_lock = threading.Lock()
+        self.output_lock = threading.Lock()
+        self.pending_frame = None
+        self.last_caption = ""
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+
+        if not CAPTION_ENABLED or not _HAS_VLM:
+            self.enabled = False
+            return
+
+        self.enabled = True
+        self.device = torch.device("cpu")
+        self.processor = BlipProcessor.from_pretrained(CAPTION_MODEL_ID)
+        self.model = BlipForConditionalGeneration.from_pretrained(CAPTION_MODEL_ID)
+        self.model.to(self.device)
+        self.model.eval()
+
+    def start(self):
+        if self.enabled:
+            self.thread.start()
+        return self
+
+    def submit(self, frame):
+        if not self.enabled:
+            return
+        with self.input_lock:
+            self.pending_frame = frame
+
+    def _worker(self):
+        while self.running:
+            with self.input_lock:
+                frame = self.pending_frame
+                self.pending_frame = None
+
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # Convert BGR to RGB and resize for VLM.
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            scale = CAPTION_IMG_SIZE / max(h, w)
+            resized = cv2.resize(rgb, (int(w * scale), int(h * scale)))
+            image = Image.fromarray(resized)
+
+            inputs = self.processor(images=image, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs,
+                    max_length=CAPTION_MAX_LEN,
+                    num_beams=3,
+                )
+            caption = self.processor.decode(out[0], skip_special_tokens=True).strip()
+
+            with self.output_lock:
+                self.last_caption = caption
+
+    def get(self):
+        if not self.enabled:
+            return ""
+        with self.output_lock:
+            return self.last_caption
+
+    def stop(self):
+        self.running = False
+        if self.enabled:
+            self.thread.join(timeout=1)
+
+captioner = AsyncCaptioner().start()
+next_caption_at = time.monotonic()
+
 while True:
     frame = latest.get()
     if frame is None:
@@ -183,6 +274,24 @@ while True:
                 cv2.LINE_AA,
             )
 
+    now = time.monotonic()
+    if CAPTION_ENABLED and now >= next_caption_at:
+        captioner.submit(resized)
+        next_caption_at = now + CAPTION_EVERY_SEC
+
+    caption = captioner.get()
+    if caption:
+        cv2.putText(
+            annotated,
+            caption,
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
     cv2.imshow("AI Camera", annotated)
 
     if cv2.waitKey(1) == 27:
@@ -191,6 +300,7 @@ while True:
     frame_idx += 1
 
 detector.stop()
+captioner.stop()
 latest.stop()
 cap.release()
 cv2.destroyAllWindows()
