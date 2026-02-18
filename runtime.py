@@ -1,21 +1,25 @@
+import asyncio
+import http.server
+import json
 import logging
 import os
+import socketserver
 import threading
 import time
 
 import cv2
 import numpy as np
 import torch
-from insightface.app import FaceAnalysis
+import websockets
 from PIL import Image
 from ultralytics import YOLO
 
 from config import AppConfig, load_config
 from db import DBClient
-from matching import FaceRegistry, assign_actions_from_pose, face_quality, iou
 
 try:
     from transformers import BlipForConditionalGeneration, BlipProcessor
+
     _HAS_VLM = True
 except Exception:
     BlipForConditionalGeneration = None
@@ -31,21 +35,213 @@ torch.set_num_interop_threads(1)
 
 def _configure_logging(level_name: str):
     level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+
+class FrameStreamer:
+    def __init__(self, jpeg_quality=72):
+        self.lock = threading.Lock()
+        self.jpg = None
+        self.index = 0
+        self.jpeg_quality = int(jpeg_quality)
+
+    def update(self, frame_bgr):
+        if frame_bgr is None or frame_bgr.size == 0:
+            return
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if not ok:
+            return
+        with self.lock:
+            self.jpg = buf.tobytes()
+            self.index += 1
+
+    def get_jpg(self):
+        with self.lock:
+            return self.jpg
+
+    def get_latest(self):
+        with self.lock:
+            return self.jpg, self.index
+
+
+class MJPEGServer:
+    def __init__(self, host, port, streamer: FrameStreamer, logger):
+        self.host = host
+        self.port = port
+        self.streamer = streamer
+        self.logger = logger
+        self.httpd = None
+        self.thread = None
+
+    def start(self):
+        streamer = self.streamer
+        logger = self.logger
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/snapshot"):
+                    jpg = streamer.get_jpg()
+                    if jpg is None:
+                        self.send_response(503)
+                        self.end_headers()
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(jpg)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        return
+                    return
+
+                if self.path != "/stream":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+
+                try:
+                    while True:
+                        jpg = streamer.get_jpg()
+                        if jpg is None:
+                            time.sleep(0.03)
+                            continue
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                        self.wfile.write(f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii"))
+                        self.wfile.write(jpg)
+                        self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                        time.sleep(0.01)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+                except Exception:
+                    logger.exception("mjpeg client error")
+
+            def log_message(self, *_args):
+                return
+
+        class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+
+        self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.logger.info("mjpeg server started", extra={"host": self.host, "port": self.port})
+        return self
+
+    def stop(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+
+
+class WSFrameServer:
+    def __init__(self, host, port, streamer: FrameStreamer, logger, flags, stream_fps=24):
+        self.host = host
+        self.port = port
+        self.streamer = streamer
+        self.logger = logger
+        self.flags = flags
+        self.stream_fps = max(1, int(stream_fps))
+        self.thread = None
+        self.loop = None
+
+    async def _handler(self, websocket, _path=None):
+        last_sent = -1
+        send_interval = 1.0 / float(self.stream_fps)
+        next_send_at = 0.0
+
+        async def _recv_loop():
+            try:
+                async for msg in websocket:
+                    if isinstance(msg, bytes):
+                        continue
+                    try:
+                        payload = json.loads(msg)
+                    except Exception:
+                        continue
+                    if payload.get("type") == "settings":
+                        self.flags.update_from(payload)
+            except websockets.ConnectionClosed:
+                return
+
+        recv_task = asyncio.create_task(_recv_loop())
+        try:
+            while True:
+                jpg, idx = self.streamer.get_latest()
+                if jpg is None or idx == last_sent:
+                    await asyncio.sleep(0.01)
+                    continue
+                now = time.perf_counter()
+                if now < next_send_at:
+                    await asyncio.sleep(next_send_at - now)
+                next_send_at = time.perf_counter() + send_interval
+                await websocket.send(jpg)
+                last_sent = idx
+        except websockets.ConnectionClosed:
+            return
+        except Exception:
+            self.logger.exception("ws client error")
+        finally:
+            recv_task.cancel()
+
+    async def _run(self):
+        async with websockets.serve(
+            self._handler,
+            self.host,
+            self.port,
+            max_size=None,
+            compression=None,
+        ):
+            self.logger.info("ws stream started", extra={"host": self.host, "port": self.port})
+            await asyncio.Future()
+
+    def start(self):
+        self.logger.info("ws stream start requested", extra={"host": self.host, "port": self.port})
+
+        def _thread_main():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            try:
+                self.loop.run_until_complete(self._run())
+            except Exception:
+                self.logger.exception("ws stream failed to start")
+
+        self.thread = threading.Thread(target=_thread_main, daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self):
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread is not None:
+            self.thread.join(timeout=2)
 
 
 class LatestFrame:
-    def __init__(self, capture, logger):
+    def __init__(self, capture, rtsp_url, logger):
         self.capture = capture
+        self.rtsp_url = rtsp_url
         self.logger = logger
         self.lock = threading.Lock()
         self.frame = None
         self.index = 0
         self.running = True
         self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.fail_count = 0
 
     def start(self):
         self.thread.start()
@@ -55,8 +251,19 @@ class LatestFrame:
         while self.running:
             ret, frame = self.capture.read()
             if not ret:
-                time.sleep(0.005)
+                self.fail_count += 1
+                if self.fail_count >= 50:
+                    self.logger.warning("reopening rtsp stream after consecutive read failures")
+                    try:
+                        self.capture.release()
+                    except Exception:
+                        pass
+                    self.capture = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                    self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    self.fail_count = 0
+                time.sleep(0.01)
                 continue
+            self.fail_count = 0
             with self.lock:
                 self.frame = frame
                 self.index += 1
@@ -64,72 +271,6 @@ class LatestFrame:
     def get(self):
         with self.lock:
             return self.frame, self.index
-
-    def stop(self):
-        self.running = False
-        self.thread.join(timeout=2)
-
-
-class AsyncDetector:
-    def __init__(self, model, cfg: AppConfig, logger):
-        self.model = model
-        self.cfg = cfg
-        self.logger = logger
-        self.input_lock = threading.Lock()
-        self.output_lock = threading.Lock()
-        self.pending = None
-        self.last_output = (0, np.empty((0, 4), dtype=np.int32), None, None, None)
-        self.running = True
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-
-    def start(self):
-        self.thread.start()
-        return self
-
-    def submit(self, frame_id, frame):
-        with self.input_lock:
-            self.pending = (frame_id, frame)
-
-    def _worker(self):
-        while self.running:
-            with self.input_lock:
-                item = self.pending
-                self.pending = None
-
-            if item is None:
-                time.sleep(0.001)
-                continue
-
-            frame_id, frame = item
-            try:
-                results = self.model.predict(
-                    frame,
-                    imgsz=self.cfg.imgsz,
-                    conf=self.cfg.conf,
-                    iou=self.cfg.iou,
-                    verbose=False,
-                    half=(self.cfg.device != "cpu"),
-                    device=self.cfg.device,
-                    max_det=self.cfg.max_det,
-                    stream=False,
-                )
-                r0 = results[0]
-                boxes = r0.boxes
-                if boxes is None or len(boxes) == 0:
-                    packed = (frame_id, np.empty((0, 4), dtype=np.int32), None, None, r0.names)
-                else:
-                    xyxy = boxes.xyxy.cpu().numpy().astype(np.int32)
-                    cls = boxes.cls.cpu().numpy().astype(np.int32) if boxes.cls is not None else None
-                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
-                    packed = (frame_id, xyxy, cls, confs, r0.names)
-                with self.output_lock:
-                    self.last_output = packed
-            except Exception:
-                self.logger.exception("detector worker error")
-
-    def get(self):
-        with self.output_lock:
-            return self.last_output
 
     def stop(self):
         self.running = False
@@ -145,21 +286,21 @@ class AsyncCaptioner:
         self.pending_frame = None
         self.last_caption = ""
         self.running = True
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-
-        if not cfg.caption_enabled or not _HAS_VLM:
-            self.enabled = False
-            return
-
-        self.enabled = True
+        self.thread = None
+        self.processor = None
+        self.model = None
         self.device = torch.device("cpu")
-        self.processor = BlipProcessor.from_pretrained(cfg.caption_model_id)
-        self.model = BlipForConditionalGeneration.from_pretrained(cfg.caption_model_id)
-        self.model.to(self.device)
-        self.model.eval()
+        self.model_ready = False
+        self.model_failed = False
+
+        self.enabled = bool(cfg.caption_enabled and _HAS_VLM)
+        if cfg.caption_enabled and not _HAS_VLM:
+            logger.warning("captioning disabled: transformers package is not installed")
+        if self.enabled:
+            self.thread = threading.Thread(target=self._worker, daemon=True)
 
     def start(self):
-        if self.enabled:
+        if self.enabled and self.thread is not None:
             self.thread.start()
         return self
 
@@ -170,6 +311,9 @@ class AsyncCaptioner:
             self.pending_frame = frame
 
     def _worker(self):
+        if not self._init_model():
+            return
+
         while self.running:
             with self.input_lock:
                 frame = self.pending_frame
@@ -190,16 +334,32 @@ class AsyncCaptioner:
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
                 with torch.no_grad():
-                    out = self.model.generate(
-                        **inputs,
-                        max_length=self.cfg.caption_max_len,
-                        num_beams=3,
-                    )
+                    out = self.model.generate(**inputs, max_length=self.cfg.caption_max_len, num_beams=1)
+
                 caption = self.processor.decode(out[0], skip_special_tokens=True).strip()
                 with self.output_lock:
                     self.last_caption = caption
             except Exception:
                 self.logger.exception("caption worker error")
+
+    def _init_model(self):
+        if self.model_ready:
+            return True
+        if self.model_failed:
+            return False
+
+        try:
+            self.processor = BlipProcessor.from_pretrained(self.cfg.caption_model_id)
+            self.model = BlipForConditionalGeneration.from_pretrained(self.cfg.caption_model_id)
+            self.model.to(self.device)
+            self.model.eval()
+            self.model_ready = True
+            self.logger.info("caption model ready", extra={"caption_model_id": self.cfg.caption_model_id})
+            return True
+        except Exception:
+            self.model_failed = True
+            self.logger.exception("captioning disabled: failed to initialize model")
+            return False
 
     def get(self):
         if not self.enabled:
@@ -209,8 +369,29 @@ class AsyncCaptioner:
 
     def stop(self):
         self.running = False
-        if self.enabled:
+        if self.enabled and self.thread is not None:
             self.thread.join(timeout=2)
+
+
+class RuntimeFlags:
+    def __init__(self, draw_boxes: bool, draw_labels: bool, show_conf: bool):
+        self.lock = threading.Lock()
+        self.draw_boxes = draw_boxes
+        self.draw_labels = draw_labels
+        self.show_conf = show_conf
+
+    def update_from(self, payload):
+        with self.lock:
+            if "draw_boxes" in payload:
+                self.draw_boxes = bool(payload["draw_boxes"])
+            if "draw_labels" in payload:
+                self.draw_labels = bool(payload["draw_labels"])
+            if "show_conf" in payload:
+                self.show_conf = bool(payload["show_conf"])
+
+    def snapshot(self):
+        with self.lock:
+            return self.draw_boxes, self.draw_labels, self.show_conf
 
 
 class AppRuntime:
@@ -218,64 +399,54 @@ class AppRuntime:
         _configure_logging(cfg.log_level)
         self.log = logging.getLogger("runtime")
         self.cfg = cfg
-        self.pose_enabled = os.path.exists(cfg.pose_model_path)
         self.db_client = DBClient(cfg.db_path, cfg.data_dir, cfg.persons_dir)
-        self.face_registry = FaceRegistry(embedding_dim=128)
-        self.face_app = None
+        self.flags = RuntimeFlags(cfg.draw_boxes, cfg.draw_labels, cfg.show_conf)
 
-        self.last_face_saved_at = {}
         self.last_action_at = {}
-        self.last_caption_action_at = 0.0
+        self.last_caption_action_at_by_camera = {}
+        self.last_caption_text_by_camera = {}
+        self.fallback_person_id = None
+        self.fallback_person_lock = threading.Lock()
+        self.stop_event = threading.Event()
 
-        # Force low-latency FFmpeg options for RTSP.
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            "rtsp_transport;udp|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
+            "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
         )
 
     def _create_detection_model(self):
         model = YOLO(self.cfg.yolo_model_path)
-        if self.cfg.device != "cpu":
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        try:
             model.fuse()
-            dummy = np.zeros((self.cfg.imgsz, self.cfg.imgsz, 3), dtype=np.uint8)
-            _ = model.predict(
-                dummy,
-                imgsz=self.cfg.imgsz,
-                conf=self.cfg.conf,
-                iou=self.cfg.iou,
-                verbose=False,
-                half=True,
-                device=self.cfg.device,
-            )
+        except Exception:
+            pass
+
+        dummy = np.zeros((self.cfg.imgsz, self.cfg.imgsz, 3), dtype=np.uint8)
+        _ = model.predict(
+            dummy,
+            imgsz=self.cfg.imgsz,
+            conf=self.cfg.conf,
+            iou=self.cfg.iou,
+            verbose=False,
+            half=False,
+            device=self.cfg.device,
+        )
         return model
 
     def _bootstrap(self):
         os.makedirs(self.cfg.persons_dir, exist_ok=True)
         conn = self.db_client.ensure_db()
-        known_ids, known_embeddings = self.db_client.load_known_faces(conn)
         conn.close()
-        self.face_registry.load(known_ids, known_embeddings)
 
-        self.face_app = FaceAnalysis(name=self.cfg.insightface_model, providers=["CPUExecutionProvider"])
-        self.face_app.prepare(ctx_id=-1, det_size=(self.cfg.face_det_size, self.cfg.face_det_size))
-
-    def _match_face(self, embedding):
-        return self.face_registry.match(embedding, self.cfg.cosine_threshold)
-
-    def _upsert_person_face(self, person_id, person_bgr, embedding, score):
-        self.db_client.upsert_person_face(person_id, person_bgr, embedding, score)
-        self.face_registry.upsert(person_id, embedding)
-
-    def _create_person(self, person_bgr, embedding, score):
-        person_id = self.db_client.create_person(embedding)
-        self._upsert_person_face(person_id, person_bgr, embedding, score)
-        return person_id
+    def _resolve_action_person_id(self, person_id):
+        if person_id is not None:
+            return person_id
+        with self.fallback_person_lock:
+            if self.fallback_person_id is None:
+                self.fallback_person_id = self.db_client.create_placeholder_person()
+            return self.fallback_person_id
 
     def _record_action(self, person_id, label, confidence, source):
-        if person_id is None:
-            return
+        person_id = self._resolve_action_person_id(person_id)
         now = time.monotonic()
         key = (person_id, label, source)
         last = self.last_action_at.get(key, 0.0)
@@ -284,326 +455,194 @@ class AppRuntime:
         self.last_action_at[key] = now
         self.db_client.record_action(person_id, label, confidence, source)
 
-    def _assign_actions_from_pose(self, pose_results, person_boxes, person_ids):
-        assign_actions_from_pose(pose_results, person_boxes, person_ids, self._record_action)
-
-    def _make_face_worker(self):
-        runtime = self
-
-        class AsyncFaceWorker:
-            def __init__(self):
-                self.input_lock = threading.Lock()
-                self.output_lock = threading.Lock()
-                self.pending = None
-                self.last_output = (0, [], [])
-                self.running = True
-                self.thread = threading.Thread(target=self._worker, daemon=True)
-                self.last_person_boxes = []
-                self.last_person_ids = []
-
-            def start(self):
-                self.thread.start()
-                return self
-
-            def submit(self, frame_id, frame, person_boxes):
-                if not person_boxes:
-                    return
-                with self.input_lock:
-                    self.pending = (frame_id, frame, person_boxes)
-
-            def _match_prev_ids(self, cur_boxes):
-                if not self.last_person_boxes or not self.last_person_ids:
-                    return [None] * len(cur_boxes)
-                ids = [None] * len(cur_boxes)
-                for i, box in enumerate(cur_boxes):
-                    best_i = -1
-                    best_iou = 0.0
-                    for j, pbox in enumerate(self.last_person_boxes):
-                        overlap = iou(box, pbox)
-                        if overlap > best_iou:
-                            best_iou = overlap
-                            best_i = j
-                    if best_i != -1 and best_iou >= 0.3:
-                        ids[i] = self.last_person_ids[best_i]
-                return ids
-
-            def _worker(self):
-                try:
-                    while self.running:
-                        with self.input_lock:
-                            item = self.pending
-                            self.pending = None
-
-                        if item is None:
-                            time.sleep(0.001)
-                            continue
-
-                        frame_id, frame, person_boxes = item
-                        person_ids = []
-                        now = time.monotonic()
-
-                        for (x1, y1, x2, y2) in person_boxes:
-                            roi = frame[y1:y2, x1:x2]
-                            if roi.size == 0:
-                                person_ids.append(None)
-                                continue
-                            try:
-                                faces = runtime.face_app.get(roi)
-                            except Exception:
-                                runtime.log.exception("face_app.get failed")
-                                person_ids.append(None)
-                                continue
-                            if not faces:
-                                person_ids.append(None)
-                                continue
-
-                            faces = sorted(
-                                faces,
-                                key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-                                reverse=True,
-                            )
-                            face = faces[0]
-                            fx1, fy1, fx2, fy2 = [int(v) for v in face.bbox]
-                            roi_h, roi_w = roi.shape[:2]
-                            fx1 = max(0, min(fx1, roi_w - 1))
-                            fy1 = max(0, min(fy1, roi_h - 1))
-                            fx2 = max(0, min(fx2, roi_w))
-                            fy2 = max(0, min(fy2, roi_h))
-                            fw = fx2 - fx1
-                            fh = fy2 - fy1
-                            if fw < runtime.cfg.min_face_size or fh < runtime.cfg.min_face_size:
-                                person_ids.append(None)
-                                continue
-
-                            face_bgr = roi[fy1:fy2, fx1:fx2]
-                            if face_bgr.size == 0:
-                                person_ids.append(None)
-                                continue
-
-                            person_bgr = roi
-                            embedding = face.normed_embedding.astype(np.float32)
-                            match_id, dist = runtime._match_face(embedding)
-
-                            quality = face_quality(face_bgr)
-                            area = (fw * fh) / max(1.0, (x2 - x1) * (y2 - y1))
-                            if match_id is None:
-                                score = 0.5 * float(face.det_score) + 0.3 * min(1.0, area * 2.0) + 0.2 * min(1.0, quality / 300.0)
-                                person_id = runtime._create_person(person_bgr, embedding, score)
-                            else:
-                                score = max(0.0, 1.0 - dist) * 0.6 + min(1.0, area * 2.0) * 0.2 + min(1.0, quality / 300.0) * 0.2
-                                person_id = match_id
-                                last_saved = runtime.last_face_saved_at.get(person_id, 0.0)
-                                if now - last_saved >= runtime.cfg.face_save_cooldown_sec:
-                                    runtime._upsert_person_face(person_id, person_bgr, embedding, score)
-                                    runtime.last_face_saved_at[person_id] = now
-                            person_ids.append(person_id)
-
-                        tracked = self._match_prev_ids(person_boxes)
-                        person_ids = [pid if pid is not None else tracked[i] for i, pid in enumerate(person_ids)]
-                        self.last_person_boxes = list(person_boxes)
-                        self.last_person_ids = list(person_ids)
-                        with self.output_lock:
-                            self.last_output = (frame_id, list(person_boxes), list(person_ids))
-                except Exception:
-                    runtime.log.exception("face worker fatal error")
-                finally:
-                    runtime.db_client.close_thread_conn()
-
-            def get(self):
-                with self.output_lock:
-                    return self.last_output
-
-            def stop(self):
-                self.running = False
-                self.thread.join(timeout=2)
-
-        return AsyncFaceWorker()
-
-    def _make_pose_worker(self, pose_model):
-        runtime = self
-
-        class AsyncPoseWorker:
-            def __init__(self, model):
-                self.model = model
-                self.input_lock = threading.Lock()
-                self.pending = None
-                self.running = True
-                self.thread = threading.Thread(target=self._worker, daemon=True)
-
-            def start(self):
-                if self.model is None:
-                    return self
-                self.thread.start()
-                return self
-
-            def submit(self, frame_id, frame, person_boxes, person_ids):
-                if self.model is None or not person_boxes:
-                    return
-                with self.input_lock:
-                    self.pending = (frame_id, frame, person_boxes, person_ids)
-
-            def _worker(self):
-                try:
-                    while self.running:
-                        with self.input_lock:
-                            item = self.pending
-                            self.pending = None
-
-                        if item is None:
-                            time.sleep(0.001)
-                            continue
-
-                        frame_id, frame, person_boxes, person_ids = item
-                        try:
-                            pose_results = self.model.predict(
-                                frame,
-                                imgsz=runtime.cfg.imgsz,
-                                conf=0.25,
-                                iou=0.5,
-                                verbose=False,
-                                device=runtime.cfg.device,
-                            )
-                            if not person_ids:
-                                person_ids = [None] * len(person_boxes)
-                            runtime._assign_actions_from_pose(pose_results, person_boxes, person_ids)
-                        except Exception:
-                            runtime.log.exception("pose worker inference error")
-                finally:
-                    runtime.db_client.close_thread_conn()
-
-            def stop(self):
-                self.running = False
-                if self.model is not None:
-                    self.thread.join(timeout=2)
-
-        return AsyncPoseWorker(pose_model)
-
     def run(self):
         self._bootstrap()
+        self.stop_event.clear()
 
-        model = self._create_detection_model()
-        pose_model = YOLO(self.cfg.pose_model_path) if self.pose_enabled else None
+        transport = os.getenv("RTSP_TRANSPORT", "udp").lower()
+        if transport not in ("udp", "tcp"):
+            transport = "udp"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
+        )
 
-        cap = cv2.VideoCapture(self.cfg.rtsp_url, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            raise RuntimeError("Unable to open RTSP stream")
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            self._run_camera_pipeline(
+                {"camera_id": "cam1", "rtsp_url": self.cfg.rtsp_url, "mjpeg_port": 8765, "ws_port": 8766}
+            )
+        except KeyboardInterrupt:
+            self.log.info("shutdown requested")
+        finally:
+            self.stop_event.set()
+            self.db_client.close_thread_conn()
 
-        if not self.cfg.headless:
-            cv2.namedWindow("AI Camera", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("AI Camera", 960, 540)
-
-        latest = LatestFrame(cap, self.log).start()
-        detector = AsyncDetector(model, self.cfg, self.log).start()
+    def _run_camera_pipeline(self, camera):
+        camera_id = camera["camera_id"]
+        rtsp_url = camera["rtsp_url"]
+        model = self._create_detection_model() if self.cfg.detection_enabled else None
         captioner = AsyncCaptioner(self.cfg, self.log).start()
-        face_worker = self._make_face_worker().start()
-        pose_worker = self._make_pose_worker(pose_model).start()
+
+        streamer = FrameStreamer(jpeg_quality=self.cfg.stream_jpeg_quality)
+        placeholder = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(
+            placeholder,
+            f"Waiting for {camera_id}...",
+            (18, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (180, 255, 180),
+            2,
+        )
+        streamer.update(placeholder)
+        mjpeg = MJPEGServer("127.0.0.1", camera["mjpeg_port"], streamer, self.log).start()
+        ws_server = WSFrameServer(
+            "127.0.0.1",
+            camera["ws_port"],
+            streamer,
+            self.log,
+            self.flags,
+            stream_fps=self.cfg.stream_fps,
+        ).start()
+
+        def _open_capture():
+            cap_local = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            if cap_local.isOpened():
+                return cap_local
+            cap_local.release()
+            return None
+
+        cap = _open_capture()
+        while cap is None and not self.stop_event.is_set():
+            self.log.warning("rtsp not available, retrying...", extra={"camera_id": camera_id})
+            time.sleep(2.0)
+            cap = _open_capture()
+
+        if cap is None:
+            captioner.stop()
+            mjpeg.stop()
+            ws_server.stop()
+            return
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        latest = LatestFrame(cap, rtsp_url, self.log).start()
 
         frame_idx = 0
         next_caption_at = time.monotonic()
         next_display_at = time.perf_counter()
         display_interval = 1.0 / max(1, self.cfg.display_fps)
+        last_boxes = np.empty((0, 4), dtype=np.int32)
+        last_cls = None
+        last_confs = None
+        last_names = None
 
         try:
-            while True:
+            while not self.stop_event.is_set():
                 now_perf = time.perf_counter()
                 if now_perf < next_display_at:
                     time.sleep(max(self.cfg.display_sleep_min, next_display_at - now_perf))
                 next_display_at = max(next_display_at + display_interval, now_perf)
 
-                frame, frame_id = latest.get()
+                frame, _frame_id = latest.get()
                 if frame is None:
                     time.sleep(0.005)
                     continue
 
                 h, w = frame.shape[:2]
                 resized = cv2.resize(frame, (int(w * self.cfg.scale), int(h * self.cfg.scale)))
-
-                if frame_idx % self.cfg.infer_every == 0:
-                    detector.submit(frame_id, resized)
-
                 annotated = resized.copy()
-                _, boxes, cls, confs, names = detector.get()
 
-                person_boxes = []
+                if model is not None and frame_idx % self.cfg.infer_every == 0:
+                    try:
+                        results = model.predict(
+                            resized,
+                            imgsz=self.cfg.imgsz,
+                            conf=self.cfg.conf,
+                            iou=self.cfg.iou,
+                            verbose=False,
+                            half=False,
+                            device=self.cfg.device,
+                            max_det=self.cfg.max_det,
+                            stream=False,
+                        )
+                        r0 = results[0]
+                        boxes_obj = r0.boxes
+                        if boxes_obj is None or len(boxes_obj) == 0:
+                            last_boxes = np.empty((0, 4), dtype=np.int32)
+                            last_cls = None
+                            last_confs = None
+                            last_names = r0.names
+                        else:
+                            last_boxes = boxes_obj.xyxy.cpu().numpy().astype(np.int32)
+                            last_cls = boxes_obj.cls.cpu().numpy().astype(np.int32) if boxes_obj.cls is not None else None
+                            last_confs = boxes_obj.conf.cpu().numpy() if boxes_obj.conf is not None else None
+                            last_names = r0.names
+                    except Exception:
+                        self.log.exception("detector inference error", extra={"camera_id": camera_id})
+
+                boxes = last_boxes
+                cls = last_cls
+                confs = last_confs
+                names = last_names
+                draw_boxes, draw_labels, show_conf = self.flags.snapshot()
+                person_seen = False
+
                 for i, box in enumerate(boxes):
                     x1, y1, x2, y2 = box
-                    if not self.cfg.headless:
+                    if draw_boxes:
                         cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    if self.cfg.draw_labels and cls is not None and confs is not None and names is not None and not self.cfg.headless:
+
+                    if draw_labels and cls is not None and confs is not None and names is not None:
                         name_idx = int(cls[i])
                         if isinstance(names, dict):
                             name_str = names.get(name_idx, str(name_idx))
                         else:
                             name_str = names[name_idx] if name_idx < len(names) else str(name_idx)
-                        label = name_str if not self.cfg.show_conf else f"{name_str} {confs[i] * 100:.1f}%"
-                        cv2.putText(annotated, label, (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-                    if names is not None and cls is not None:
-                        name_idx = int(cls[i])
-                        if isinstance(names, dict):
-                            name_str = names.get(name_idx, "")
-                        else:
-                            name_str = names[name_idx] if name_idx < len(names) else ""
+                        label = name_str if not show_conf else f"{name_str} {confs[i] * 100:.1f}%"
+                        cv2.putText(
+                            annotated,
+                            label,
+                            (x1, max(0, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
                         if name_str == "person":
-                            person_boxes.append((x1, y1, x2, y2))
+                            person_seen = True
 
                 now = time.monotonic()
                 if self.cfg.caption_enabled and now >= next_caption_at:
                     captioner.submit(resized)
                     next_caption_at = now + self.cfg.caption_every_sec
-
                 caption = captioner.get()
-                if caption and not self.cfg.headless:
-                    cv2.putText(annotated, caption, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
 
-                if frame_idx % self.cfg.face_every == 0 and person_boxes:
-                    face_worker.submit(frame_id, resized, person_boxes)
-                _, face_boxes, face_ids = face_worker.get()
+                if model is not None and person_seen:
+                    self._record_action(None, "person_detected", None, f"{camera_id}:detector")
 
-                person_ids = []
-                if face_boxes:
-                    person_ids = list(face_ids)
-                if len(person_ids) != len(person_boxes):
-                    person_ids = [None] * len(person_boxes)
+                if self.cfg.use_caption_as_action and caption:
+                    last = self.last_caption_action_at_by_camera.get(camera_id, 0.0)
+                    last_text = self.last_caption_text_by_camera.get(camera_id, "")
+                    if now - last >= self.cfg.caption_action_min_interval_sec and caption != last_text:
+                        self._record_action(None, caption, None, f"{camera_id}:caption")
+                        self.last_caption_action_at_by_camera[camera_id] = now
+                        self.last_caption_text_by_camera[camera_id] = caption
 
-                if self.pose_enabled and frame_idx % self.cfg.action_every == 0 and person_boxes:
-                    pose_worker.submit(frame_id, resized, person_boxes, person_ids)
-
-                if self.cfg.use_caption_as_action and caption and person_boxes:
-                    if now - self.last_caption_action_at >= self.cfg.caption_action_min_interval_sec:
-                        for pid in person_ids:
-                            if pid is not None:
-                                self._record_action(pid, caption, None, "caption")
-                        self.last_caption_action_at = now
-
-                if self.cfg.headless:
-                    frame_idx += 1
-                    continue
-
-                cv2.imshow("AI Camera", annotated)
-                if cv2.waitKey(1) == 27:
-                    break
+                streamer.update(annotated)
                 frame_idx += 1
-        except KeyboardInterrupt:
-            self.log.info("shutdown requested")
         finally:
-            detector.stop()
             captioner.stop()
-            face_worker.stop()
-            pose_worker.stop()
             latest.stop()
             cap.release()
-            if not self.cfg.headless:
-                cv2.destroyAllWindows()
-            self.db_client.close_thread_conn()
+            mjpeg.stop()
+            ws_server.stop()
 
 
 def main():
     cfg = load_config(".env")
-    device = 0 if torch.cuda.is_available() else "cpu"
-    cfg = AppConfig(**{**cfg.__dict__, "device": device})
+    cfg = AppConfig(**{**cfg.__dict__, "device": "cpu", "headless": True})
     runtime = AppRuntime(cfg)
-    runtime.log.info("starting runtime", extra={"device": str(device)})
+    runtime.log.info("starting runtime", extra={"device": "cpu"})
     runtime.run()
 
 

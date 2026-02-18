@@ -141,6 +141,18 @@ class DBClient:
             conn.commit()
         return person_id
 
+    def create_placeholder_person(self):
+        with self.write_lock:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO persons (created_at, last_seen_at, best_face_path, best_face_score, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?, ?)",
+                (now_iso(), now_iso(), None, 0.0, None, None),
+            )
+            person_id = cur.lastrowid
+            conn.commit()
+        return person_id
+
     def upsert_person_face(self, person_id, person_bgr, embedding, score):
         with self.write_lock:
             conn = self.get_conn()
@@ -167,6 +179,17 @@ class DBClient:
         with self.write_lock:
             conn = self.get_conn()
             cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT person_id, action_label, source
+                FROM actions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            )
+            last = cur.fetchone()
+            if last and last[0] == person_id and last[1] == label and last[2] == source:
+                return
             cur.execute(
                 """
                 INSERT INTO actions (person_id, action_label, action_confidence, source, created_at)

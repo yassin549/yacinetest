@@ -1,0 +1,22 @@
+{
+  "name": "mluser-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "powershell -NoProfile -Command \"$env:ESBUILD_BINARY_PATH='node_modules/@esbuild/win32-x64/bin/esbuild.exe'; vite\"",
+    "build": "powershell -NoProfile -Command \"$env:ESBUILD_BINARY_PATH='node_modules/@esbuild/win32-x64/bin/esbuild.exe'; vite build\"",
+    "preview": "powershell -NoProfile -Command \"$env:ESBUILD_BINARY_PATH='node_modules/@esbuild/win32-x64/bin/esbuild.exe'; vite preview\"",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@sveltejs/vite-plugin-svelte": "^3.0.2",
+    "svelte": "^4.2.19",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  }
+}

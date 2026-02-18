@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass
-from urllib.parse import quote
 
 
 @dataclass(frozen=True)
@@ -14,16 +13,19 @@ class AppConfig:
     pose_model_path: str = "yolov8n-pose.pt"
     yolo_model_path: str = "yolov8n.pt"
 
-    scale: float = 0.45
-    imgsz: int = 320
+    scale: float = 0.35
+    imgsz: int = 224
     conf: float = 0.45
     iou: float = 0.5
     max_det: int = 50
     device: str = "cpu"
 
-    infer_every: int = 3
+    infer_every: int = 8
     face_every: int = 4
     action_every: int = 6
+    detection_enabled: bool = True
+    face_enabled: bool = True
+    pose_enabled: bool = True
 
     min_face_size: int = 40
     face_save_cooldown_sec: float = 2.0
@@ -32,15 +34,19 @@ class AppConfig:
     face_det_size: int = 480
 
     caption_enabled: bool = False
-    caption_every_sec: float = 5.0
-    caption_img_size: int = 384
+    caption_every_sec: float = 12.0
+    caption_img_size: int = 224
     caption_model_id: str = "Salesforce/blip-image-captioning-base"
     caption_max_len: int = 30
     use_caption_as_action: bool = False
+    caption_allow_scene_action: bool = True
     caption_action_min_interval_sec: float = 5.0
 
     display_fps: int = 30
     display_sleep_min: float = 0.001
+    stream_fps: int = 30
+    stream_jpeg_quality: int = 60
+    draw_boxes: bool = True
     draw_labels: bool = True
     show_conf: bool = True
     headless: bool = False
@@ -80,24 +86,11 @@ def load_dotenv(path: str = ".env"):
             os.environ.setdefault(key, val)
 
 
-def _build_rtsp_url_from_env() -> str:
+def _load_rtsp_url() -> str:
     env_url = os.getenv("RTSP_URL")
     if env_url:
         return env_url
-
-    user = os.getenv("RTSP_USERNAME")
-    password = os.getenv("RTSP_PASSWORD")
-    host = os.getenv("RTSP_HOST", "192.168.1.29")
-    port = int(os.getenv("RTSP_PORT", "554"))
-    path = os.getenv("RTSP_PATH", "/cam/realmonitor?channel=1&subtype=0")
-    if not path.startswith("/"):
-        path = f"/{path}"
-
-    if not (user and password):
-        raise RuntimeError(
-            "Missing RTSP credentials. Set RTSP_URL or RTSP_USERNAME/RTSP_PASSWORD in environment or .env file."
-        )
-    return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}{path}"
+    raise RuntimeError("Missing RTSP_URL in environment or .env file.")
 
 
 def load_config(env_path: str = ".env") -> AppConfig:
@@ -111,33 +104,40 @@ def load_config(env_path: str = ".env") -> AppConfig:
         insightface_model=os.getenv("INSIGHTFACE_MODEL", "buffalo_s"),
         pose_model_path=os.getenv("POSE_MODEL_PATH", "yolov8n-pose.pt"),
         yolo_model_path=os.getenv("YOLO_MODEL_PATH", "yolov8n.pt"),
-        scale=float(os.getenv("SCALE", "0.45")),
-        imgsz=int(os.getenv("IMGSZ", "320")),
+        scale=float(os.getenv("SCALE", "0.35")),
+        imgsz=int(os.getenv("IMGSZ", "224")),
         conf=float(os.getenv("CONF", "0.45")),
         iou=float(os.getenv("IOU", "0.5")),
         max_det=int(os.getenv("MAX_DET", "50")),
         device=os.getenv("DEVICE", "cpu"),
-        infer_every=int(os.getenv("INFER_EVERY", "3")),
+        infer_every=int(os.getenv("INFER_EVERY", "8")),
         face_every=int(os.getenv("FACE_EVERY", "4")),
         action_every=int(os.getenv("ACTION_EVERY", "6")),
+        detection_enabled=_parse_bool(os.getenv("DETECTION_ENABLED"), True),
+        face_enabled=_parse_bool(os.getenv("FACE_ENABLED"), True),
+        pose_enabled=_parse_bool(os.getenv("POSE_ENABLED"), True),
         min_face_size=int(os.getenv("MIN_FACE_SIZE", "40")),
         face_save_cooldown_sec=float(os.getenv("FACE_SAVE_COOLDOWN_SEC", "2.0")),
         cosine_threshold=float(os.getenv("COSINE_THRESHOLD", "0.35")),
         action_min_interval_sec=float(os.getenv("ACTION_MIN_INTERVAL_SEC", "2.0")),
         face_det_size=int(os.getenv("FACE_DET_SIZE", "480")),
         caption_enabled=_parse_bool(os.getenv("CAPTION_ENABLED"), False),
-        caption_every_sec=float(os.getenv("CAPTION_EVERY_SEC", "5.0")),
-        caption_img_size=int(os.getenv("CAPTION_IMG_SIZE", "384")),
+        caption_every_sec=float(os.getenv("CAPTION_EVERY_SEC", "12.0")),
+        caption_img_size=int(os.getenv("CAPTION_IMG_SIZE", "224")),
         caption_model_id=os.getenv("CAPTION_MODEL_ID", "Salesforce/blip-image-captioning-base"),
         caption_max_len=int(os.getenv("CAPTION_MAX_LEN", "30")),
         use_caption_as_action=_parse_bool(os.getenv("USE_CAPTION_AS_ACTION"), False),
+        caption_allow_scene_action=_parse_bool(os.getenv("CAPTION_ALLOW_SCENE_ACTION"), True),
         caption_action_min_interval_sec=float(os.getenv("CAPTION_ACTION_MIN_INTERVAL_SEC", "5.0")),
         display_fps=int(os.getenv("DISPLAY_FPS", "30")),
         display_sleep_min=float(os.getenv("DISPLAY_SLEEP_MIN", "0.001")),
+        stream_fps=int(os.getenv("STREAM_FPS", "30")),
+        stream_jpeg_quality=int(os.getenv("STREAM_JPEG_QUALITY", "60")),
+        draw_boxes=_parse_bool(os.getenv("DRAW_BOXES"), True),
         draw_labels=_parse_bool(os.getenv("DRAW_LABELS"), True),
         show_conf=_parse_bool(os.getenv("SHOW_CONF"), True),
         headless=_parse_bool(os.getenv("HEADLESS"), False),
-        rtsp_url=_build_rtsp_url_from_env(),
+        rtsp_url=_load_rtsp_url(),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
 
@@ -151,5 +151,13 @@ def load_config(env_path: str = ".env") -> AppConfig:
         raise ValueError("DISPLAY_FPS must be >= 1")
     if cfg.min_face_size < 1:
         raise ValueError("MIN_FACE_SIZE must be >= 1")
+    if cfg.caption_every_sec <= 0:
+        raise ValueError("CAPTION_EVERY_SEC must be > 0")
+    if cfg.caption_img_size < 64:
+        raise ValueError("CAPTION_IMG_SIZE must be >= 64")
+    if cfg.stream_fps < 1:
+        raise ValueError("STREAM_FPS must be >= 1")
+    if cfg.stream_jpeg_quality < 40 or cfg.stream_jpeg_quality > 95:
+        raise ValueError("STREAM_JPEG_QUALITY must be between 40 and 95")
 
     return cfg

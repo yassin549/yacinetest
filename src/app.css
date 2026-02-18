@@ -1,0 +1,41 @@
+:root {
+  color-scheme: light;
+  --bg: #f2eee7;
+  --bg-2: #e6ddd0;
+  --panel: #ffffff;
+  --ink: #1c1c1c;
+  --muted: #6b6864;
+  --accent: #2a6f6b;
+  --accent-2: #7eb594;
+  --danger: #b4432a;
+  --border: #ddd3c5;
+  --shadow: 0 14px 28px rgba(27, 24, 20, 0.1);
+  --radius: 16px;
+  --radius-sm: 10px;
+  --mono: "IBM Plex Mono", "Consolas", monospace;
+  --sans: "Sora", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  background:
+    radial-gradient(circle at 10% 15%, rgba(126, 181, 148, 0.2), transparent 38%),
+    radial-gradient(circle at 88% 9%, rgba(42, 111, 107, 0.1), transparent 34%),
+    linear-gradient(165deg, #f8f4ed 0%, #ede5db 46%, #e4dacc 100%);
+  color: var(--ink);
+  min-height: 100vh;
+  overflow-y: auto;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+button {
+  font-family: var(--sans);
+}

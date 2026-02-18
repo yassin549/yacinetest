@@ -1,80 +1,93 @@
-# yacinetest
+# MLUser Production Runtime
 
-how to run : 
-Create .env from .env.example and set your RTSP credentials.
-  2. Install deps: pip install -r requirements.txt
-  3. Run headless for deployment:
-      - HEADLESS=true
-      - python mluser.py
-## Install
+MLUser is a Python RTSP vision runtime with a Tauri + Svelte desktop control UI.
+
+## What this build does
+
+- Runs YOLO object detection on an RTSP stream.
+- Streams annotated frames over local MJPEG and WebSocket endpoints.
+- Stores deduplicated action events in SQLite.
+- Optionally runs BLIP captioning and logs captions as actions.
+
+## Repository layout
+
+- `mluser.py`: runtime entrypoint.
+- `runtime.py`: production pipeline (capture, detect, stream, action logging).
+- `config.py`: `.env` parsing and validated runtime config.
+- `db.py`: SQLite schema and thread-local connection handling.
+- `matching.py`: face/pose helper utilities and embedding registry.
+- `src/`: Svelte frontend.
+- `src-tauri/`: Tauri desktop wrapper.
+
+## Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+- Rust toolchain (for Tauri desktop app)
+
+## Python setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Configuration
+Create `.env` from `.env.example` and set at least:
 
-Create a `.env` file in the project root.
-
-You can copy from `.env.example`.
-
-Set either full RTSP URL:
-
-```bash
-RTSP_URL=rtsp://user:pass@192.168.1.29:554/cam/realmonitor?channel=1&subtype=0
-```
-
-Or set credential parts:
-
-```bash
-RTSP_USERNAME=your_user
-RTSP_PASSWORD=your_password
-RTSP_HOST=192.168.1.29
-RTSP_PORT=554
-RTSP_PATH=/cam/realmonitor?channel=1&subtype=0
-```
-
-Optional performance tuning in `.env`:
-
-```bash
-SCALE=0.4
-IMGSZ=320
-INFER_EVERY=4
-FACE_EVERY=6
-ACTION_EVERY=8
-FACE_DET_SIZE=320
-```
-
-Production defaults:
-
-```bash
+```env
+RTSP_URL=rtsp://user:pass@host:554/path
 HEADLESS=true
 LOG_LEVEL=INFO
 ```
 
-## Run
+Recommended production values:
+
+```env
+SCALE=0.35
+IMGSZ=224
+INFER_EVERY=8
+STREAM_FPS=30
+STREAM_JPEG_QUALITY=60
+CAPTION_ENABLED=false
+USE_CAPTION_AS_ACTION=false
+```
+
+Run runtime:
 
 ```bash
 python mluser.py
 ```
 
-## Module Layout
+## Desktop app (Tauri + Svelte)
 
-- `mluser.py`: thin entrypoint.
-- `runtime.py`: production runtime loop, worker orchestration, graceful shutdown, logging.
-- `config.py`: validated environment-driven app configuration.
-- `db.py`: SQLite schema management and thread-local DB access.
-- `matching.py`: face registry, embedding matching, and pose/action matching logic.
-
-## Production Notes
-
-- Use `.env` for all secrets and runtime settings.
-- Set `HEADLESS=true` for server deployment.
-- Use `LOG_LEVEL=INFO` (or `DEBUG` for diagnosis).
-- Avoid committing local runtime artifacts (`data/`, `.env`, `*.db*`).
-
-## Smoke Tests
+Install frontend dependencies:
 
 ```bash
-python -m unittest tests/test_smoke.py
+npm install
 ```
+
+Run desktop dev mode:
+
+```bash
+npm run tauri dev
+```
+
+Build desktop bundle:
+
+```bash
+npm run tauri build
+```
+
+## Tests
+
+Run smoke tests:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+## Deployment notes
+
+- Keep secrets only in `.env`.
+- Do not commit runtime artifacts (`data/`, `.env`, `dist/`, `src-tauri/target/`).
+- Keep model files outside source control unless explicitly required.
+- Prefer CPU-only deployment unless GPU acceleration is configured intentionally.

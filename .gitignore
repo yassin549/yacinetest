@@ -8,3 +8,10 @@ credentials.txt
 __pycache__/
 *.pyc
 *.pyc.*
+node_modules/
+dist/
+.npm-cache/
+src-tauri/target/
+.venv/
+.pytest_cache/
+*.log

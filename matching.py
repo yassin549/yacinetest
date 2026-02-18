@@ -5,8 +5,10 @@ import numpy as np
 
 
 def cosine_distance(a, b):
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-6
-    return 1.0 - float(np.dot(a, b) / denom)
+    a_vec = np.asarray(a, dtype=np.float32)
+    b_vec = np.asarray(b, dtype=np.float32)
+    denom = (np.linalg.norm(a_vec) * np.linalg.norm(b_vec)) + 1e-6
+    return 1.0 - float(np.dot(a_vec, b_vec) / denom)
 
 
 class FaceRegistry:
@@ -14,30 +16,46 @@ class FaceRegistry:
         self.lock = threading.Lock()
         self.embedding_dim = embedding_dim
         self.known_ids = []
+        self._id_to_index = {}
         self.known_embeddings = np.empty((0, embedding_dim), dtype=np.float32)
 
     def load(self, ids, embeddings):
         with self.lock:
             self.known_ids = list(ids)
-            self.known_embeddings = embeddings.astype(np.float32, copy=True)
+            self._id_to_index = {pid: i for i, pid in enumerate(self.known_ids)}
+            embs = np.asarray(embeddings, dtype=np.float32)
+            if embs.size == 0:
+                self.known_embeddings = np.empty((0, self.embedding_dim), dtype=np.float32)
+            else:
+                self.known_embeddings = embs.reshape(len(self.known_ids), -1)
 
     def upsert(self, person_id, embedding):
+        emb = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
         with self.lock:
-            if person_id in self.known_ids:
-                idx = self.known_ids.index(person_id)
-                self.known_embeddings[idx] = embedding
+            idx = self._id_to_index.get(person_id)
+            if idx is not None:
+                self.known_embeddings[idx] = emb[0]
+                return
+
+            self._id_to_index[person_id] = len(self.known_ids)
+            self.known_ids.append(person_id)
+            if self.known_embeddings.size == 0:
+                self.known_embeddings = emb
             else:
-                self.known_ids.append(person_id)
-                if self.known_embeddings.size == 0:
-                    self.known_embeddings = embedding.reshape(1, -1)
-                else:
-                    self.known_embeddings = np.vstack([self.known_embeddings, embedding.reshape(1, -1)])
+                self.known_embeddings = np.vstack([self.known_embeddings, emb])
 
     def match(self, embedding, threshold):
         with self.lock:
             if self.known_embeddings.size == 0:
                 return None, None
-            distances = np.array([cosine_distance(e, embedding) for e in self.known_embeddings], dtype=np.float32)
+
+            query = np.asarray(embedding, dtype=np.float32)
+            embs = self.known_embeddings
+            query_norm = np.linalg.norm(query) + 1e-6
+            emb_norms = np.linalg.norm(embs, axis=1) + 1e-6
+            similarities = np.dot(embs, query) / (emb_norms * query_norm)
+            distances = 1.0 - similarities
+
             best_idx = int(np.argmin(distances))
             best_dist = float(distances[best_idx])
             if best_dist <= threshold:
@@ -69,13 +87,11 @@ def classify_pose_action(kpts, kpt_conf, bbox):
     if aspect > 1.3:
         return "lying", 0.5
 
-    # Arms raised
     if _valid(5) and _valid(9) and kpts[9][1] < kpts[5][1] - 10:
         return "arms_raised", 0.6
     if _valid(6) and _valid(10) and kpts[10][1] < kpts[6][1] - 10:
         return "arms_raised", 0.6
 
-    # Standing vs sitting using knee-hip angle heuristic
     if _valid(11) and _valid(13) and _valid(15):
         hip = kpts[11]
         knee = kpts[13]
