@@ -74,6 +74,41 @@ def face_quality(face_bgr):
         return 0.0
 
 
+def build_haar_face_detector():
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+    return detector
+
+
+def detect_faces_haar(detector, frame_bgr, min_face_size):
+    if detector is None or detector.empty() or frame_bgr is None or frame_bgr.size == 0:
+        return []
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    faces = detector.detectMultiScale(
+        gray,
+        scaleFactor=1.12,
+        minNeighbors=5,
+        minSize=(int(min_face_size), int(min_face_size)),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+    out = []
+    for (x, y, w, h) in faces:
+        out.append((int(x), int(y), int(x + w), int(y + h)))
+    return out
+
+
+def extract_face_embedding(face_bgr):
+    if face_bgr is None or face_bgr.size == 0:
+        return None
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (16, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
+    small = (small - np.mean(small)) / (np.std(small) + 1e-6)
+    emb = small.flatten().astype(np.float32)
+    norm = np.linalg.norm(emb) + 1e-6
+    emb = emb / norm
+    return emb
+
+
 def classify_pose_action(kpts, kpt_conf, bbox):
     # COCO keypoints: 5/6 shoulders, 7/8 elbows, 9/10 wrists, 11/12 hips, 13/14 knees, 15/16 ankles
     def _valid(idx):

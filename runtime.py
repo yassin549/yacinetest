@@ -16,6 +16,7 @@ from ultralytics import YOLO
 
 from config import AppConfig, load_config
 from db import DBClient
+from matching import FaceRegistry, build_haar_face_detector, detect_faces_haar, extract_face_embedding, face_quality
 
 try:
     from transformers import BlipForConditionalGeneration, BlipProcessor
@@ -134,6 +135,7 @@ class MJPEGServer:
 
         class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
             daemon_threads = True
+            allow_reuse_address = True
 
         self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -144,6 +146,7 @@ class MJPEGServer:
     def stop(self):
         if self.httpd is not None:
             self.httpd.shutdown()
+            self.httpd.server_close()
         if self.thread is not None:
             self.thread.join(timeout=2)
 
@@ -158,6 +161,8 @@ class WSFrameServer:
         self.stream_fps = max(1, int(stream_fps))
         self.thread = None
         self.loop = None
+        self.server = None
+        self.shutdown_event = None
 
     async def _handler(self, websocket, _path=None):
         last_sent = -1
@@ -199,15 +204,18 @@ class WSFrameServer:
             recv_task.cancel()
 
     async def _run(self):
-        async with websockets.serve(
+        self.server = await websockets.serve(
             self._handler,
             self.host,
             self.port,
             max_size=None,
             compression=None,
-        ):
-            self.logger.info("ws stream started", extra={"host": self.host, "port": self.port})
-            await asyncio.Future()
+        )
+        self.shutdown_event = asyncio.Event()
+        self.logger.info("ws stream started", extra={"host": self.host, "port": self.port})
+        await self.shutdown_event.wait()
+        self.server.close()
+        await self.server.wait_closed()
 
     def start(self):
         self.logger.info("ws stream start requested", extra={"host": self.host, "port": self.port})
@@ -219,6 +227,16 @@ class WSFrameServer:
                 self.loop.run_until_complete(self._run())
             except Exception:
                 self.logger.exception("ws stream failed to start")
+            finally:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    try:
+                        self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                self.loop.close()
 
         self.thread = threading.Thread(target=_thread_main, daemon=True)
         self.thread.start()
@@ -226,7 +244,10 @@ class WSFrameServer:
 
     def stop(self):
         if self.loop is not None:
-            self.loop.call_soon_threadsafe(self.loop.stop)
+            if self.shutdown_event is not None:
+                self.loop.call_soon_threadsafe(self.shutdown_event.set)
+            else:
+                self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread is not None:
             self.thread.join(timeout=2)
 
@@ -403,15 +424,97 @@ class AppRuntime:
         self.flags = RuntimeFlags(cfg.draw_boxes, cfg.draw_labels, cfg.show_conf)
 
         self.last_action_at = {}
+        self.last_sighting_at = {}
         self.last_caption_action_at_by_camera = {}
         self.last_caption_text_by_camera = {}
         self.fallback_person_id = None
         self.fallback_person_lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.face_registry = FaceRegistry(embedding_dim=128)
+        self.face_detector = build_haar_face_detector() if cfg.face_enabled else None
 
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
             "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
         )
+
+    def _set_ffmpeg_capture_options(self, transport: str):
+        selected = (transport or "udp").lower()
+        if selected not in ("udp", "tcp"):
+            selected = "udp"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;{selected}|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
+        )
+
+    def _open_capture_with_retry(self, camera_id: str, rtsp_url: str):
+        def _open_capture():
+            cap_local = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            if cap_local.isOpened():
+                return cap_local
+            cap_local.release()
+            return None
+
+        cap = _open_capture()
+        while cap is None and not self.stop_event.is_set():
+            self.log.warning("rtsp not available, retrying...", extra={"camera_id": camera_id})
+            time.sleep(2.0)
+            cap = _open_capture()
+        return cap
+
+    def _predict_detections(self, model, frame, camera_id):
+        try:
+            results = model.predict(
+                frame,
+                imgsz=self.cfg.imgsz,
+                conf=self.cfg.conf,
+                iou=self.cfg.iou,
+                verbose=False,
+                half=False,
+                device=self.cfg.device,
+                max_det=self.cfg.max_det,
+                stream=False,
+            )
+            r0 = results[0]
+            boxes_obj = r0.boxes
+            if boxes_obj is None or len(boxes_obj) == 0:
+                return np.empty((0, 4), dtype=np.int32), None, None, r0.names
+            boxes = boxes_obj.xyxy.cpu().numpy().astype(np.int32)
+            cls = boxes_obj.cls.cpu().numpy().astype(np.int32) if boxes_obj.cls is not None else None
+            confs = boxes_obj.conf.cpu().numpy() if boxes_obj.conf is not None else None
+            return boxes, cls, confs, r0.names
+        except Exception:
+            self.log.exception("detector inference error", extra={"camera_id": camera_id})
+            return None
+
+    def _draw_detections(self, frame, boxes, cls, confs, names):
+        draw_boxes, draw_labels, show_conf = self.flags.snapshot()
+        person_seen = False
+
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = box
+            if draw_boxes:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            if draw_labels and cls is not None and confs is not None and names is not None:
+                name_idx = int(cls[i])
+                if isinstance(names, dict):
+                    name_str = names.get(name_idx, str(name_idx))
+                else:
+                    name_str = names[name_idx] if name_idx < len(names) else str(name_idx)
+                label = name_str if not show_conf else f"{name_str} {confs[i] * 100:.1f}%"
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+                if name_str == "person":
+                    person_seen = True
+
+        return person_seen
 
     def _create_detection_model(self):
         model = YOLO(self.cfg.yolo_model_path)
@@ -435,6 +538,8 @@ class AppRuntime:
     def _bootstrap(self):
         os.makedirs(self.cfg.persons_dir, exist_ok=True)
         conn = self.db_client.ensure_db()
+        ids, embeddings = self.db_client.load_known_faces(conn)
+        self.face_registry.load(ids, embeddings)
         conn.close()
 
     def _resolve_action_person_id(self, person_id):
@@ -455,16 +560,75 @@ class AppRuntime:
         self.last_action_at[key] = now
         self.db_client.record_action(person_id, label, confidence, source)
 
+    def _should_record_sighting(self, person_id, camera_id):
+        key = (camera_id, int(person_id))
+        now = time.monotonic()
+        last = self.last_sighting_at.get(key, 0.0)
+        if now - last < self.cfg.face_save_cooldown_sec:
+            return False
+        self.last_sighting_at[key] = now
+        return True
+
+    def _identify_faces(self, frame_bgr, camera_id):
+        if not self.cfg.face_enabled or self.face_detector is None:
+            return []
+        faces = detect_faces_haar(self.face_detector, frame_bgr, self.cfg.min_face_size)
+        results = []
+        for x1, y1, x2, y2 in faces:
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame_bgr.shape[1], x2)
+            y2 = min(frame_bgr.shape[0], y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame_bgr[y1:y2, x1:x2]
+            embedding = extract_face_embedding(crop)
+            if embedding is None or embedding.size == 0:
+                continue
+
+            person_id, dist = self.face_registry.match(embedding, threshold=self.cfg.cosine_threshold)
+            if person_id is None:
+                person_id = self.db_client.create_person(embedding)
+                self.face_registry.upsert(person_id, embedding)
+                self._record_action(person_id, "person_profile_created", None, f"{camera_id}:face_id")
+
+            quality = face_quality(crop)
+            self.db_client.upsert_person_face(person_id, crop, embedding, quality)
+
+            if self._should_record_sighting(person_id, camera_id):
+                self.db_client.record_sighting(person_id, camera_id, quality)
+                self._record_action(person_id, "face_seen", None, f"{camera_id}:face_id")
+
+            results.append({"box": (x1, y1, x2, y2), "person_id": person_id, "distance": dist, "quality": quality})
+        return results
+
+    def _draw_face_identities(self, frame_bgr, faces):
+        if not faces:
+            return
+        for item in faces:
+            x1, y1, x2, y2 = item["box"]
+            person_id = item["person_id"]
+            dist = item["distance"]
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (91, 214, 146), 2)
+            if dist is None:
+                label = f"P{person_id} new"
+            else:
+                label = f"P{person_id} d={dist:.2f}"
+            cv2.putText(
+                frame_bgr,
+                label,
+                (x1, max(0, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.46,
+                (91, 214, 146),
+                1,
+                cv2.LINE_AA,
+            )
+
     def run(self):
         self._bootstrap()
         self.stop_event.clear()
-
-        transport = os.getenv("RTSP_TRANSPORT", "udp").lower()
-        if transport not in ("udp", "tcp"):
-            transport = "udp"
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            f"rtsp_transport;{transport}|fflags;nobuffer|flags;low_delay|max_delay;0|stimeout;2000000|buffer_size;102400"
-        )
+        self._set_ffmpeg_capture_options(os.getenv("RTSP_TRANSPORT", "udp"))
 
         try:
             self._run_camera_pipeline(
@@ -503,19 +667,7 @@ class AppRuntime:
             self.flags,
             stream_fps=self.cfg.stream_fps,
         ).start()
-
-        def _open_capture():
-            cap_local = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-            if cap_local.isOpened():
-                return cap_local
-            cap_local.release()
-            return None
-
-        cap = _open_capture()
-        while cap is None and not self.stop_event.is_set():
-            self.log.warning("rtsp not available, retrying...", extra={"camera_id": camera_id})
-            time.sleep(2.0)
-            cap = _open_capture()
+        cap = self._open_capture_with_retry(camera_id, rtsp_url)
 
         if cap is None:
             captioner.stop()
@@ -534,6 +686,7 @@ class AppRuntime:
         last_cls = None
         last_confs = None
         last_names = None
+        last_faces = []
 
         try:
             while not self.stop_event.is_set():
@@ -552,64 +705,18 @@ class AppRuntime:
                 annotated = resized.copy()
 
                 if model is not None and frame_idx % self.cfg.infer_every == 0:
-                    try:
-                        results = model.predict(
-                            resized,
-                            imgsz=self.cfg.imgsz,
-                            conf=self.cfg.conf,
-                            iou=self.cfg.iou,
-                            verbose=False,
-                            half=False,
-                            device=self.cfg.device,
-                            max_det=self.cfg.max_det,
-                            stream=False,
-                        )
-                        r0 = results[0]
-                        boxes_obj = r0.boxes
-                        if boxes_obj is None or len(boxes_obj) == 0:
-                            last_boxes = np.empty((0, 4), dtype=np.int32)
-                            last_cls = None
-                            last_confs = None
-                            last_names = r0.names
-                        else:
-                            last_boxes = boxes_obj.xyxy.cpu().numpy().astype(np.int32)
-                            last_cls = boxes_obj.cls.cpu().numpy().astype(np.int32) if boxes_obj.cls is not None else None
-                            last_confs = boxes_obj.conf.cpu().numpy() if boxes_obj.conf is not None else None
-                            last_names = r0.names
-                    except Exception:
-                        self.log.exception("detector inference error", extra={"camera_id": camera_id})
+                    prediction = self._predict_detections(model, resized, camera_id)
+                    if prediction is not None:
+                        last_boxes, last_cls, last_confs, last_names = prediction
 
                 boxes = last_boxes
                 cls = last_cls
                 confs = last_confs
                 names = last_names
-                draw_boxes, draw_labels, show_conf = self.flags.snapshot()
-                person_seen = False
-
-                for i, box in enumerate(boxes):
-                    x1, y1, x2, y2 = box
-                    if draw_boxes:
-                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                    if draw_labels and cls is not None and confs is not None and names is not None:
-                        name_idx = int(cls[i])
-                        if isinstance(names, dict):
-                            name_str = names.get(name_idx, str(name_idx))
-                        else:
-                            name_str = names[name_idx] if name_idx < len(names) else str(name_idx)
-                        label = name_str if not show_conf else f"{name_str} {confs[i] * 100:.1f}%"
-                        cv2.putText(
-                            annotated,
-                            label,
-                            (x1, max(0, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            1,
-                            cv2.LINE_AA,
-                        )
-                        if name_str == "person":
-                            person_seen = True
+                person_seen = self._draw_detections(annotated, boxes, cls, confs, names)
+                if self.cfg.face_enabled and frame_idx % self.cfg.face_every == 0:
+                    last_faces = self._identify_faces(resized, camera_id)
+                self._draw_face_identities(annotated, last_faces)
 
                 now = time.monotonic()
                 if self.cfg.caption_enabled and now >= next_caption_at:
@@ -617,7 +724,7 @@ class AppRuntime:
                     next_caption_at = now + self.cfg.caption_every_sec
                 caption = captioner.get()
 
-                if model is not None and person_seen:
+                if model is not None and person_seen and not self.cfg.face_enabled:
                     self._record_action(None, "person_detected", None, f"{camera_id}:detector")
 
                 if self.cfg.use_caption_as_action and caption:

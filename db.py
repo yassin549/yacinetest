@@ -39,6 +39,7 @@ class DBClient:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 0,
                 best_face_path TEXT,
                 best_face_score REAL DEFAULT 0.0,
                 embedding BLOB,
@@ -74,14 +75,31 @@ class DBClient:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS person_sightings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_id INTEGER NOT NULL,
+                camera_id TEXT NOT NULL,
+                face_score REAL,
+                seen_at TEXT NOT NULL,
+                FOREIGN KEY(person_id) REFERENCES persons(id)
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_person_id ON actions(person_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sightings_person_id ON person_sightings(person_id)")
         try:
             cur.execute("ALTER TABLE persons ADD COLUMN embedding BLOB")
         except sqlite3.OperationalError:
             pass
         try:
             cur.execute("ALTER TABLE persons ADD COLUMN embedding_dim INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute("ALTER TABLE persons ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         conn.commit()
@@ -134,8 +152,8 @@ class DBClient:
             conn = self.get_conn()
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO persons (created_at, last_seen_at, best_face_path, best_face_score, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?, ?)",
-                (now_iso(), now_iso(), None, 0.0, embedding.astype(np.float32).tobytes(), int(embedding.size)),
+                "INSERT INTO persons (created_at, last_seen_at, seen_count, best_face_path, best_face_score, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now_iso(), now_iso(), 0, None, 0.0, embedding.astype(np.float32).tobytes(), int(embedding.size)),
             )
             person_id = cur.lastrowid
             conn.commit()
@@ -146,8 +164,8 @@ class DBClient:
             conn = self.get_conn()
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO persons (created_at, last_seen_at, best_face_path, best_face_score, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?, ?)",
-                (now_iso(), now_iso(), None, 0.0, None, None),
+                "INSERT INTO persons (created_at, last_seen_at, seen_count, best_face_path, best_face_score, embedding, embedding_dim) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now_iso(), now_iso(), 0, None, 0.0, None, None),
             )
             person_id = cur.lastrowid
             conn.commit()
@@ -202,3 +220,79 @@ class DBClient:
                 (now_iso(), person_id),
             )
             conn.commit()
+
+    def record_sighting(self, person_id, camera_id, face_score):
+        seen_at = now_iso()
+        with self.write_lock:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO person_sightings (person_id, camera_id, face_score, seen_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (person_id, camera_id, face_score, seen_at),
+            )
+            cur.execute(
+                """
+                UPDATE persons
+                SET last_seen_at = ?, seen_count = COALESCE(seen_count, 0) + 1
+                WHERE id = ?
+                """,
+                (seen_at, person_id),
+            )
+            conn.commit()
+
+    def list_persons(self, limit=200):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, created_at, last_seen_at, seen_count, best_face_path, best_face_score
+            FROM persons
+            ORDER BY COALESCE(last_seen_at, created_at) DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return cur.fetchall()
+
+    def get_person_profile(self, person_id, sightings_limit=120, actions_limit=120):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, created_at, last_seen_at, seen_count, best_face_path, best_face_score
+            FROM persons
+            WHERE id = ?
+            """,
+            (int(person_id),),
+        )
+        person_row = cur.fetchone()
+        if person_row is None:
+            return None, [], []
+
+        cur.execute(
+            """
+            SELECT camera_id, face_score, seen_at
+            FROM person_sightings
+            WHERE person_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(person_id), int(sightings_limit)),
+        )
+        sightings = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT action_label, action_confidence, source, created_at
+            FROM actions
+            WHERE person_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(person_id), int(actions_limit)),
+        )
+        actions = cur.fetchall()
+        return person_row, sightings, actions

@@ -28,12 +28,13 @@ body {
     radial-gradient(circle at 88% 9%, rgba(42, 111, 107, 0.1), transparent 34%),
     linear-gradient(165deg, #f8f4ed 0%, #ede5db 46%, #e4dacc 100%);
   color: var(--ink);
-  min-height: 100vh;
-  overflow-y: auto;
+  height: 100vh;
+  overflow: hidden;
 }
 
 #app {
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 button {

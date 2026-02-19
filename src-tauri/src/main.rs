@@ -8,7 +8,7 @@ use std::{
     sync::Mutex,
 };
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::State;
 
@@ -224,6 +224,38 @@ struct ActionRow {
     created_at: String,
 }
 
+#[derive(Serialize)]
+struct PersonRow {
+    id: i64,
+    created_at: String,
+    last_seen_at: String,
+    seen_count: i64,
+    best_face_path: Option<String>,
+    best_face_score: f64,
+}
+
+#[derive(Serialize)]
+struct SightingRow {
+    camera_id: String,
+    face_score: Option<f64>,
+    seen_at: String,
+}
+
+#[derive(Serialize)]
+struct PersonActionRow {
+    action_label: String,
+    action_confidence: Option<f64>,
+    source: String,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+struct PersonProfile {
+    person: PersonRow,
+    sightings: Vec<SightingRow>,
+    actions: Vec<PersonActionRow>,
+}
+
 #[tauri::command]
 fn read_actions(_app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<ActionRow>, String> {
     let env = read_env(_app)?;
@@ -261,6 +293,135 @@ fn read_actions(_app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<Action
 }
 
 #[tauri::command]
+fn read_people(_app: tauri::AppHandle, limit: Option<u32>) -> Result<Vec<PersonRow>, String> {
+    let env = read_env(_app)?;
+    let db_path = resolve_db_path(&env);
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, created_at, last_seen_at, COALESCE(seen_count, 0), best_face_path, COALESCE(best_face_score, 0.0)
+             FROM persons
+             ORDER BY COALESCE(last_seen_at, created_at) DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let limit_val = limit.unwrap_or(200) as i64;
+    let rows = stmt
+        .query_map(params![limit_val], |row| {
+            Ok(PersonRow {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                last_seen_at: row.get(2)?,
+                seen_count: row.get(3)?,
+                best_face_path: row.get(4)?,
+                best_face_score: row.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn read_person_profile(
+    _app: tauri::AppHandle,
+    person_id: i64,
+    sightings_limit: Option<u32>,
+    actions_limit: Option<u32>,
+) -> Result<Option<PersonProfile>, String> {
+    let env = read_env(_app)?;
+    let db_path = resolve_db_path(&env);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    let person = conn
+        .query_row(
+            "SELECT id, created_at, last_seen_at, COALESCE(seen_count, 0), best_face_path, COALESCE(best_face_score, 0.0)
+             FROM persons
+             WHERE id = ?1",
+            params![person_id],
+            |row| {
+                Ok(PersonRow {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    last_seen_at: row.get(2)?,
+                    seen_count: row.get(3)?,
+                    best_face_path: row.get(4)?,
+                    best_face_score: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some(person) = person else {
+        return Ok(None);
+    };
+
+    let sight_limit = sightings_limit.unwrap_or(120) as i64;
+    let mut sight_stmt = conn
+        .prepare(
+            "SELECT camera_id, face_score, seen_at
+             FROM person_sightings
+             WHERE person_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let sight_rows = sight_stmt
+        .query_map(params![person_id, sight_limit], |row| {
+            Ok(SightingRow {
+                camera_id: row.get(0)?,
+                face_score: row.get(1)?,
+                seen_at: row.get(2)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut sightings = Vec::new();
+    for row in sight_rows {
+        sightings.push(row.map_err(|e| e.to_string())?);
+    }
+
+    let act_limit = actions_limit.unwrap_or(120) as i64;
+    let mut act_stmt = conn
+        .prepare(
+            "SELECT action_label, action_confidence, source, created_at
+             FROM actions
+             WHERE person_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let act_rows = act_stmt
+        .query_map(params![person_id, act_limit], |row| {
+            Ok(PersonActionRow {
+                action_label: row.get(0)?,
+                action_confidence: row.get(1)?,
+                source: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut actions = Vec::new();
+    for row in act_rows {
+        actions.push(row.map_err(|e| e.to_string())?);
+    }
+
+    Ok(Some(PersonProfile {
+        person,
+        sightings,
+        actions,
+    }))
+}
+
+#[tauri::command]
 fn start_runtime(_app: tauri::AppHandle, state: State<RuntimeState>) -> Result<(), String> {
     start_runtime_inner(&state).map_err(|e| e.to_string())
 }
@@ -292,6 +453,8 @@ fn main() {
             read_env,
             write_env,
             read_actions,
+            read_people,
+            read_person_profile,
             apply_settings,
             get_runtime_info,
             start_runtime,
