@@ -8,6 +8,7 @@ use std::{
     sync::Mutex,
 };
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::State;
@@ -446,6 +447,57 @@ fn apply_settings(
     Ok(())
 }
 
+#[tauri::command]
+fn read_face_image(_app: tauri::AppHandle, person_id: i64) -> Result<Option<String>, String> {
+    let env = read_env(_app)?;
+    let db_path = resolve_db_path(&env);
+    let base = base_dir();
+
+    // Try to read best_face_path from DB first
+    let face_path: Option<PathBuf> = if db_path.exists() {
+        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+        let path_str: Option<String> = conn
+            .query_row(
+                "SELECT best_face_path FROM persons WHERE id = ?1",
+                params![person_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .flatten();
+        path_str.map(|p| {
+            let pb = PathBuf::from(&p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                base.join(&p)
+            }
+        })
+    } else {
+        None
+    };
+
+    // Fallback to conventional path
+    let face_path = face_path.unwrap_or_else(|| {
+        let persons_dir = env
+            .get("PERSONS_DIR")
+            .map(|s| base.join(s))
+            .unwrap_or_else(|| {
+                let data_dir = env.get("DATA_DIR").map(String::as_str).unwrap_or("data");
+                base.join(data_dir).join("persons")
+            });
+        persons_dir.join(format!("person_{}.jpg", person_id))
+    });
+
+    if !face_path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&face_path).map_err(|e| e.to_string())?;
+    let encoded = BASE64.encode(&bytes);
+    Ok(Some(encoded))
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(RuntimeState::default())
@@ -455,6 +507,7 @@ fn main() {
             read_actions,
             read_people,
             read_person_profile,
+            read_face_image,
             apply_settings,
             get_runtime_info,
             start_runtime,

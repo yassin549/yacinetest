@@ -24,9 +24,8 @@
   let connectRetryTimer = null;
 
   let objectIdentification = true;
-  let faceIdentification = true;
-  let vlmEnabled = false;
   let actionsHint = "";
+  let personFaceImages = {};
 
   let ws = null;
   let streamCanvas = null;
@@ -83,11 +82,16 @@
     try {
       const rows = await invoke("read_people", { limit: 220 });
       people = rows;
+      const keepIds = new Set(people.map((p) => p.id));
+      personFaceImages = Object.fromEntries(
+        Object.entries(personFaceImages).filter(([id]) => keepIds.has(Number(id)))
+      );
       if (!people.length) {
         selectedPersonId = null;
         personProfile = null;
         return;
       }
+      await Promise.all(people.map((person) => loadFaceImage(person.id)));
       if (selectedPersonId === null || !people.some((p) => p.id === selectedPersonId)) {
         selectedPersonId = people[0].id;
       }
@@ -109,8 +113,23 @@
         actions_limit: 120
       });
       personProfile = profile;
+      if (personProfile?.person?.id) {
+        await loadFaceImage(personProfile.person.id);
+      }
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const loadFaceImage = async (personId) => {
+    if (!personId || personFaceImages[personId] !== undefined) return;
+    try {
+      const encoded = await invoke("read_face_image", { person_id: personId });
+      const image = encoded ? `data:image/jpeg;base64,${encoded}` : "";
+      personFaceImages = { ...personFaceImages, [personId]: image };
+    } catch (err) {
+      console.error(err);
+      personFaceImages = { ...personFaceImages, [personId]: "" };
     }
   };
 
@@ -120,9 +139,7 @@
   };
 
   const loadActionsHint = () => {
-    actionsHint = vlmEnabled
-      ? "Face events are paired with VLM captions in profiles."
-      : "VLM is off; face sightings remain logged for each profile.";
+    actionsHint = "Face ID and VLM captions are always active. Use Object Identification to control overlays.";
   };
 
   const loadSettings = async () => {
@@ -132,8 +149,6 @@
         env.DETECTION_ENABLED,
         envBool(env.DRAW_BOXES, true) && envBool(env.DRAW_LABELS, true) && envBool(env.SHOW_CONF, true)
       );
-      faceIdentification = envBool(env.FACE_ENABLED, true);
-      vlmEnabled = envBool(env.CAPTION_ENABLED, false);
       loadActionsHint();
     } catch (err) {
       console.error(err);
@@ -161,10 +176,10 @@
           DRAW_BOXES: objectIdentification ? "true" : "false",
           DRAW_LABELS: objectIdentification ? "true" : "false",
           SHOW_CONF: objectIdentification ? "true" : "false",
-          FACE_ENABLED: faceIdentification ? "true" : "false",
+          FACE_ENABLED: "true",
           POSE_ENABLED: "false",
-          CAPTION_ENABLED: vlmEnabled ? "true" : "false",
-          USE_CAPTION_AS_ACTION: vlmEnabled ? "true" : "false",
+          CAPTION_ENABLED: "true",
+          USE_CAPTION_AS_ACTION: "true",
           CAPTION_ALLOW_SCENE_ACTION: "true",
           CAPTION_EVERY_SEC: "12.0",
           CAPTION_IMG_SIZE: "224",
@@ -258,14 +273,7 @@
       streamCanvas.height = canvasHeight;
     }
 
-    streamCtx.setTransform(1, 0, 0, 1, 0, 0);
-    streamCtx.clearRect(0, 0, streamCanvas.width, streamCanvas.height);
-    const scale = Math.min(streamCanvas.width / bitmap.width, streamCanvas.height / bitmap.height);
-    const drawW = Math.floor(bitmap.width * scale);
-    const drawH = Math.floor(bitmap.height * scale);
-    const dx = Math.floor((streamCanvas.width - drawW) / 2);
-    const dy = Math.floor((streamCanvas.height - drawH) / 2);
-    streamCtx.drawImage(bitmap, dx, dy, drawW, drawH);
+    streamCtx.drawImage(bitmap, 0, 0, streamCanvas.width, streamCanvas.height);
     bitmap.close();
 
     const now = performance.now();
@@ -477,26 +485,6 @@
                 <span class="slider"></span>
               </label>
             </div>
-            <div class="toggle-row">
-              <div>
-                <div class="toggle-title">Face Identification</div>
-                <div class="toggle-hint">Track faces as profiles.</div>
-              </div>
-              <label class="switch">
-                <input type="checkbox" bind:checked={faceIdentification} on:change={queueApplyFeatureToggles} />
-                <span class="slider"></span>
-              </label>
-            </div>
-            <div class="toggle-row">
-              <div>
-                <div class="toggle-title">VLM Captions</div>
-                <div class="toggle-hint">Log scene descriptions as actions.</div>
-              </div>
-              <label class="switch">
-                <input type="checkbox" bind:checked={vlmEnabled} on:change={queueApplyFeatureToggles} />
-                <span class="slider"></span>
-              </label>
-            </div>
             {#if togglesPending}
               <div class="state-chip">Applying settings…</div>
             {/if}
@@ -519,7 +507,16 @@
                   class={`person-item ${selectedPersonId === person.id ? "active" : ""}`}
                   on:click={() => selectPerson(person.id)}
                 >
-                  <span class="pid">P{person.id}</span>
+                  <div class="person-head">
+                    <div class="person-avatar">
+                      {#if personFaceImages[person.id]}
+                        <img src={personFaceImages[person.id]} alt={`P${person.id}`} />
+                      {:else}
+                        <span>?</span>
+                      {/if}
+                    </div>
+                    <span class="pid">P{person.id}</span>
+                  </div>
                   <span class="seen">{person.seen_count} sightings</span>
                   <span class="last">{person.last_seen_at}</span>
                 </button>
@@ -532,8 +529,17 @@
           {#if !personProfile}
             <div class="empty-note">Select a person to view history.</div>
           {:else}
+            <div class="profile-top">
+              <div class="profile-avatar profile-avatar-lg">
+                {#if personFaceImages[personProfile.person.id]}
+                  <img src={personFaceImages[personProfile.person.id]} alt={`P${personProfile.person.id}`} />
+                {:else}
+                  <span>?</span>
+                {/if}
+              </div>
+              <div class="profile-id">P{personProfile.person.id}</div>
+            </div>
             <div class="profile-grid">
-              <div class="profile-k">Profile ID</div><div class="profile-v">P{personProfile.person.id}</div>
               <div class="profile-k">First Seen</div><div class="profile-v">{personProfile.person.created_at}</div>
               <div class="profile-k">Last Seen</div><div class="profile-v">{personProfile.person.last_seen_at}</div>
               <div class="profile-k">Sightings</div><div class="profile-v">{personProfile.person.seen_count}</div>
@@ -611,7 +617,7 @@
     align-items: center;
     gap: 10px;
     border-radius: 10px;
-    padding: 4px 12px;
+    padding: 8px 16px;
     background: rgba(246, 239, 229, 0.9);
     border: 1px solid rgba(42, 111, 107, 0.2);
     flex-shrink: 0;
@@ -780,8 +786,8 @@
     background: transparent;
     border-radius: 10px;
     overflow: hidden;
-    flex: 1;
-    min-height: 0;
+    width: 100%;
+    aspect-ratio: 16 / 9;
   }
 
   .stream-canvas,
@@ -1043,6 +1049,54 @@
     gap: 4px;
   }
 
+  .person-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .person-avatar,
+  .profile-avatar {
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid rgba(120, 150, 130, 0.4);
+    background: rgba(16, 27, 19, 0.85);
+    display: grid;
+    place-items: center;
+    color: #9abca2;
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+
+  .person-avatar img,
+  .profile-avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .profile-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 12px 0;
+  }
+
+  .profile-avatar-lg {
+    width: 64px;
+    height: 64px;
+    font-size: 16px;
+  }
+
+  .profile-id {
+    color: #9fe870;
+    font-size: 20px;
+    font-weight: 700;
+    font-family: var(--mono);
+  }
+
   .person-item.active {
     border-color: rgba(110, 219, 181, 0.6);
     background: rgba(38, 72, 57, 0.8);
@@ -1130,4 +1184,3 @@
     }
   }
 </style>
-

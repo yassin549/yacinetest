@@ -25,6 +25,7 @@ class DBClient:
         cur.execute("PRAGMA journal_mode=WAL")
         cur.execute("PRAGMA synchronous=NORMAL")
         cur.execute("PRAGMA temp_store=MEMORY")
+        cur.execute("PRAGMA foreign_keys=ON")
         conn.commit()
 
     def ensure_db(self):
@@ -90,6 +91,9 @@ class DBClient:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_person_id ON actions(person_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sightings_person_id ON person_sightings(person_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sightings_camera_id ON person_sightings(camera_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_actions_created_at ON actions(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_persons_last_seen ON persons(last_seen_at)")
         try:
             cur.execute("ALTER TABLE persons ADD COLUMN embedding BLOB")
         except sqlite3.OperationalError:
@@ -296,3 +300,29 @@ class DBClient:
         )
         actions = cur.fetchall()
         return person_row, sightings, actions
+
+    def clean_stale_profiles(self):
+        """Remove persons with zero sightings and no face image (test/orphan data)."""
+        with self.write_lock:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM actions WHERE person_id IN (
+                    SELECT p.id FROM persons p
+                    LEFT JOIN person_sightings ps ON ps.person_id = p.id
+                    WHERE p.best_face_path IS NULL
+                      AND ps.id IS NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM persons
+                WHERE best_face_path IS NULL
+                  AND id NOT IN (SELECT DISTINCT person_id FROM person_sightings)
+                """
+            )
+            removed = cur.rowcount
+            conn.commit()
+            return removed
